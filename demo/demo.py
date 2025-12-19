@@ -25,10 +25,28 @@ from pytorch3d.io import save_obj
 from pytorch3d.structures import Meshes
 # [ADICIONADO] Importa cat
 from detectron2.layers import cat
+from pytorch3d.renderer import (
+    look_at_view_transform,
+    FoVPerspectiveCameras, 
+    RasterizationSettings, 
+    MeshRasterizer, 
+    SoftSilhouetteShader,
+    BlendParams
+)
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
 
 
 logger = logging.getLogger("demo")
 
+def get_symmetry_loss(verts):
+    # Assume que o objeto está centralizado no eixo X
+    # Criamos uma cópia invertida dos vértices
+    verts_left = verts.clone()
+    verts_left[:, 0] = -verts_left[:, 0] 
+    
+    # A perda é a diferença média entre a posição original e a espelhada
+    loss_sym = torch.mean(torch.norm(verts - verts_left, dim=1))
+    return loss_sym
 
 class VisualizationDemo:
     def __init__(self, cfg, vis_highest_scoring=True, output_dir="./vis"):
@@ -48,6 +66,72 @@ class VisualizationDemo:
 
         os.makedirs(output_dir, exist_ok=True)
         self.output_dir = output_dir
+    
+    def refine_predicted_mesh(self, mesh, target_mask, device):
+        # Preparação da máscara
+        h, w = target_mask.shape
+        target_mask_resized = torch.nn.functional.interpolate(
+            target_mask.view(1, 1, h, w).float(), 
+            size=(256, 256), mode="bilinear", align_corners=False
+        ).squeeze()
+
+        # Configuração do Renderizador Diferenciável
+        R = torch.eye(3).unsqueeze(0).to(device)
+        T = torch.zeros(1, 3).to(device)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T, fov=60.0)
+        raster_settings = RasterizationSettings(image_size=256, blur_radius=1e-5, faces_per_pixel=50)
+        renderer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+        shader = SoftSilhouetteShader(blend_params=BlendParams(sigma=1e-4, gamma=1e-4))
+
+        # CONFIGURAÇÃO DOS PARÂMETROS DE LAYOUT 
+        verts = mesh.verts_packed()
+        verts_params = torch.nn.Parameter(verts.clone().detach(), requires_grad=True)
+        
+        
+        translation = torch.nn.Parameter(torch.zeros((1, 3), device=device), requires_grad=True)
+        
+        # Otimizador com dois grupos de parâmetros
+        optimizer = torch.optim.Adam([verts_params, translation], lr=0.002)
+
+        print("Executando Cronograma de Otimização USL...")
+        for i in range(100):
+            optimizer.zero_grad()
+            
+            # Aplicamos a translação
+            translated_verts = verts_params + translation
+            new_mesh = mesh.update_padded(translated_verts.unsqueeze(0))
+            
+            # 1. Perdas de Dados (Silhueta e Simetria)
+            fragments = renderer(new_mesh)
+            silhouette = shader(fragments, new_mesh)
+            loss_sil = torch.sum((silhouette[..., 3] - target_mask_resized)**2)
+            loss_sym = get_symmetry_loss(translated_verts)
+            
+            # 2. Perdas Geométricas (Suavização)
+            loss_lap = mesh_laplacian_smoothing(new_mesh)
+            loss_normal = mesh_normal_consistency(new_mesh)
+            
+           
+            
+            if i < 50:
+                w_sil = 10.0
+                w_lap = 5.0
+            
+            else:
+                w_sil = 2.0
+                w_lap = 30.0  
+            
+            total_loss = (w_sil * loss_sil) + (2.0 * loss_sym) + \
+                         (w_lap * loss_lap) + (5.0 * loss_normal)
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            if i % 25 == 0:
+                print(f"  > Iteração {i}, Loss: {total_loss.item():.4f}")
+        
+        # Retorna a malha final com os vértices já movidos para a posição correta
+        return mesh.update_padded((verts_params + translation).unsqueeze(0))
 
     def run_on_image(self, image, focal_length=10.0):
         """
@@ -165,18 +249,26 @@ class VisualizationDemo:
                     det_id < len(scores) and \
                     det_id < len(masks) and \
                     det_id < len(meshes):
-                     self.visualize_prediction(
-                         det_id,
-                         image,
-                         boxes.tensor[det_id],
-                         labels[det_id],
-                         scores[det_id],
-                         masks[det_id],
-                         meshes[det_id],
-                     )
+                    
+                    # --- UPGRADE: REFINAMENTO USL INICIADO AQUI ---
+                    current_mesh = meshes[det_id]
+                    current_mask = masks[det_id].float() # A máscara precisa ser float para a loss
+                    
+                    # Chamamos o refinamento que você já colou no arquivo
+                    refined_mesh = self.refine_predicted_mesh(current_mesh, current_mask, self.cpu_device)
+                    # ----------------------------------------------
+
+                    self.visualize_prediction(
+                        det_id,
+                        image,
+                        boxes.tensor[det_id],
+                        labels[det_id],
+                        scores[det_id],
+                        masks[det_id],
+                        refined_mesh, # Enviamos a malha REFINADA para visualizar/salvar
+                    )
 
         return predictions
-
     # --- (Função visualize_prediction inalterada) ---
     def visualize_prediction(
         self, det_id, image, box, label, score, mask, mesh, alpha=0.6, dpi=200
